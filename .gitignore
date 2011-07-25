@@ -9,6 +9,13 @@
 *.wsgi
 local_settings.py
 development_settings.py
+<<<<<<< HEAD
 .project
 .pydevproject
 *.egg-info
+=======
+*.egg-info
+.project
+.pydevproject
+.settings
+>>>>>>> 70877eb957c23e692650f26cc830b57d45d81446

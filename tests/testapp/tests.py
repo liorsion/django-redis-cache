@@ -10,7 +10,7 @@ from django import VERSION
 from django.core.cache import get_cache
 from django.test import TestCase
 from models import Poll, expensive_calculation
-from redis_cache.cache import RedisCache
+from redis_cache.cache import RedisCache, ImproperlyConfigured
 
 # functions/classes for complex data type tests
 def f():
@@ -26,10 +26,15 @@ class RedisCacheTests(TestCase):
     """
     def setUp(self):
         # use DB 16 for testing and hope there isn't any important data :->
+        self.reset_pool()
         self.cache = self.get_cache()
 
     def tearDown(self):
         self.cache.clear()
+
+    def reset_pool(self):
+        if hasattr(self, 'cache'):
+            self.cache._client.connection_pool.disconnect()
 
     def get_cache(self, backend=None):
         if VERSION[0] == 1 and VERSION[1] < 3:
@@ -39,18 +44,17 @@ class RedisCacheTests(TestCase):
         return cache
 
     def test_bad_db_initialization(self):
-        self.cache = self.get_cache('redis_cache.cache://127.0.0.1:6379?db=not_a_number')
-        self.assertEqual(self.cache._cache.connection_pool.connection_kwargs['db'], 1)
+        self.assertRaises(ImproperlyConfigured, self.get_cache, 'redis_cache.cache://127.0.0.1:6379?db=not_a_number')
 
     def test_bad_port_initialization(self):
-        self.cache = self.get_cache('redis_cache.cache://127.0.0.1:not_a_number?db=15')
-        self.assertEqual(self.cache._cache.connection_pool.connection_kwargs['port'], 6379)
+        self.assertRaises(ImproperlyConfigured, self.get_cache, 'redis_cache.cache://127.0.0.1:not_a_number?db=15')
 
     def test_default_initialization(self):
+        self.reset_pool()
         self.cache = self.get_cache('redis_cache.cache://127.0.0.1')
-        self.assertEqual(self.cache._cache.connection_pool.connection_kwargs['host'], '127.0.0.1')
-        self.assertEqual(self.cache._cache.connection_pool.connection_kwargs['db'], 1)
-        self.assertEqual(self.cache._cache.connection_pool.connection_kwargs['port'], 6379)
+        self.assertEqual(self.cache._client.connection_pool.connection_kwargs['host'], '127.0.0.1')
+        self.assertEqual(self.cache._client.connection_pool.connection_kwargs['db'], 1)
+        self.assertEqual(self.cache._client.connection_pool.connection_kwargs['port'], 6379)
 
     def test_simple(self):
         # Simple cache set/get works
@@ -190,36 +194,7 @@ class RedisCacheTests(TestCase):
     def test_set_expiration_timeout_None(self):
         key, value = self.cache.make_key('key'), 'value'
         self.cache.set(key, value);
-        self.assertTrue(self.cache._cache.ttl(key) > 0)
-
-    def test_set_expiration_timeout_0(self):
-        key, value = self.cache.make_key('key'), 'value'
-        self.cache.set(key, value)
-        self.assertTrue(self.cache._cache.ttl(key) > 0)
-        self.cache.expire(key, 0)
-        self.assertEqual(self.cache.get(key), value)
-        self.assertTrue(self.cache._cache.ttl(key) < 0)
-
-    def test_set_expiration_first_expire_call(self):
-        key, value = self.cache.make_key('key'), 'value'
-        # bypass public set api so we don't set the expiration
-        self.cache._cache.set(key, pickle.dumps(value))
-        self.cache.expire('key', 1)
-        time.sleep(2)
-        self.assertEqual(self.cache.get('key'), None)
-
-    def test_set_expiration_mulitple_expire_calls(self):
-        key, value = 'key', 'value'
-        self.cache.set(key, value, 1)
-        time.sleep(2)
-        self.assertEqual(self.cache.get('key'), None)
-        self.cache.set(key, value, 100)
-        self.assertEqual(self.cache.get('key'), value)
-        time.sleep(2)
-        self.assertEqual(self.cache.get('key'), value)
-        self.cache.expire(key, 1)
-        time.sleep(2)
-        self.assertEqual(self.cache.get('key'), None)
+        self.assertTrue(self.cache._client.ttl(key) > 0)
 
     def test_unicode(self):
         # Unicode values can be cached
@@ -302,25 +277,32 @@ class RedisCacheTests(TestCase):
             self.assertEqual(self.cache.get(old_key), None)
             self.assertEqual(self.cache.get(new_key), 'spam')
 
-    def test_connection_pool(self):
-        # First, let's make sure that one connection exists in the pool
-        self.assertEqual(self.cache._cache.connection_pool._created_connections, 1)
+    def test_incr_with_pickled_integer(self):
+        "Testing case where there exists a pickled integer and we increment it"
+        number = 42
+        key = self.cache.make_key("key")
 
-        # Now, let's tie up two connections in the pool.
-        c1 = self.cache._cache.connection_pool.get_connection("_")
-        self.assertEqual(self.cache._cache.connection_pool._created_connections, 1)
-        c2 = self.cache._cache.connection_pool.get_connection("_")
-        self.assertEqual(self.cache._cache.connection_pool._created_connections, 2)
+        # manually set value using the redis client
+        self.cache._client.set(key, pickle.dumps(number))
+        new_value = self.cache.incr(key)
+        self.assertEqual(new_value, number + 1)
 
-        # with 2 connections tied up, lets access a view makes sure it creates
-        # another connection
-        self.client.get("/")
-        self.assertEqual(self.cache._cache.connection_pool._created_connections, 3)
+        # Test that the pickled value was converted to an integer
+        value = int(self.cache._client.get(key))
+        self.assertTrue(isinstance(value, int))
 
-        # The previous request releases the connection, let's call the view again
-        # and make sure that only 3 connections are created
-        self.client.get("/")
-        self.assertEqual(self.cache._cache.connection_pool._created_connections, 3)
+        # now that the value is an integer, let's increment it again.
+        new_value = self.cache.incr(key, 7)
+        self.assertEqual(new_value, number + 8)
+
+    def test_pickling_cache_object(self):
+        p = pickle.dumps(self.cache)
+        cache = pickle.loads(p)
+        # Now let's do a simple operation using the unpickled cache object
+        cache.add("addkey1", "value")
+        result = cache.add("addkey1", "newvalue")
+        self.assertEqual(result, False)
+        self.assertEqual(cache.get("addkey1"), "value")
 
 
 if __name__ == '__main__':

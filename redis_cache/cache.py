@@ -1,4 +1,5 @@
 from django.core.cache.backends.base import BaseCache, InvalidCacheBackendError
+from django.core.exceptions import ImproperlyConfigured
 from django.utils.encoding import smart_unicode, smart_str
 from django.utils.datastructures import SortedDict
 from django.conf import settings
@@ -14,25 +15,6 @@ except ImportError:
     raise InvalidCacheBackendError(
         "Redis cache backend requires the 'redis-py' library")
 
-
-class CacheConnectionPool(object):
-    _connection_pool = None
-
-    def get_connection_pool(self, host='127.0.0.1', port=6379, db=1, password=None,
-        socket_timeout=None, connection_pool=None, charset='utf-8', errors='strict'):
-        if self._connection_pool is None:
-            kwargs = {
-                'db': db,
-                'password': password,
-                'socket_timeout': socket_timeout,
-                'encoding': charset,
-                'encoding_errors': errors,
-                'host': host,
-                'port': port
-            }
-            self._connection_pool = redis.ConnectionPool(**kwargs)
-        return self._connection_pool
-pool = CacheConnectionPool()
 
 class CacheKey(object):
     """
@@ -56,26 +38,35 @@ class CacheClass(BaseCache):
         """
         Connect to Redis, and set up cache backend.
         """
+        self._init(server, params)
+
+    def _init(self, server, params):
         super(CacheClass, self).__init__(params)
+        self._initargs = { 'server': server, 'params': params }
         options = params.get('OPTIONS', {})
         password = params.get('password', options.get('PASSWORD', None))
         db = params.get('db', options.get('DB', 1))
         try:
             db = int(db)
         except (ValueError, TypeError):
-            db = 1
+            raise ImproperlyConfigured("db value must be an integer")
         if ':' in server:
             host, port = server.split(':')
             try:
                 port = int(port)
             except (ValueError, TypeError):
-                port = 6379
+                raise ImproperlyConfigured("port value must be an integer")
         else:
             host = server or 'localhost'
             port = 6379
         self._cache = redis.Redis(host=host, port=port, db=db,
             password=password, connection_pool=pool.get_connection_pool(host=host, port=port, db=db, password=password))
 
+    def __getstate__(self):
+        return self._initargs
+
+    def __setstate__(self, state):
+        self._init(**state)
 
     def make_key(self, key, version=None):
         """
@@ -93,7 +84,7 @@ class CacheClass(BaseCache):
         Returns ``True`` if the object was added, ``False`` if not.
         """
         key = self.make_key(key, version=version)
-        if self._cache.exists(key):
+        if self._client.exists(key):
             return False
         return self.set(key, value, timeout)
 
@@ -104,46 +95,39 @@ class CacheClass(BaseCache):
         Returns unpickled value if key is found, the default if not.
         """
         key = self.make_key(key, version=version)
-        value = self._cache.get(key)
+        value = self._client.get(key)
         if value is None:
             return default
-        return self.unpickle(value)
+        try:
+            result = int(value)
+        except (ValueError, TypeError):
+            result = self.unpickle(value)
+        return result
 
-    def set(self, key, value, timeout=None, version=None):
+
+    def set(self, key, value, timeout=None, version=None, client=None):
         """
         Persist a value to the cache, and set an optional expiration time.
         """
+        if not client:
+            client = self._client
         key = self.make_key(key, version=version)
-        # store the pickled value
-        result = self._cache.set(key, pickle.dumps(value))
-        # set expiration if needed
-        self.expire(key, timeout, version=version)
+        if not timeout:
+            timeout = self.default_timeout
+        try:
+            value = int(value)
+        except (ValueError, TypeError):
+            result = self._client.setex(key, pickle.dumps(value), int(timeout))
+        else:
+            result = self._client.setex(key, value, int(timeout))
         # result is a boolean
         return result
-
-    def expire(self, key, timeout=None, version=None):
-        """
-        Set content expiration, if necessary
-        """
-        key = self.make_key(key, version=version)
-        if timeout is None:
-            timeout = self.default_timeout
-        if timeout <= 0:
-            # force the key to be non-volatile
-            result = self._cache.get(key)
-            self._cache.set(key, result)
-        else:
-            # If the expiration command returns false, we need to reset the key
-            # with the new expiration
-            if not self._cache.expire(key, timeout):
-                value = self.get(key, version=version)
-                self.set(key, value, timeout, version=version)
 
     def delete(self, key, version=None):
         """
         Remove a key from the cache.
         """
-        self._cache.delete(self.make_key(key, version=version))
+        self._client.delete(self.make_key(key, version=version))
 
     def delete_many(self, keys, version=None):
         """
@@ -151,14 +135,14 @@ class CacheClass(BaseCache):
         """
         if keys:
             keys = map(lambda key: self.make_key(key, version=version), keys)
-            self._cache.delete(*keys)
+            self._client.delete(*keys)
 
     def clear(self):
         """
         Flush all cache keys.
         """
         # TODO : potential data loss here, should we only delete keys based on the correct version ?
-        self._cache.flushdb()
+        self._client.flushdb()
 
     def unpickle(self, value):
         """
@@ -171,10 +155,12 @@ class CacheClass(BaseCache):
         """
         Retrieve many keys.
         """
+        if not keys:
+            return {}
         recovered_data = SortedDict()
         new_keys = map(lambda key: self.make_key(key, version=version), keys)
         map_keys = dict(zip(new_keys, keys))
-        results = self._cache.mget(new_keys)
+        results = self._client.mget(new_keys)
         for key, value in zip(new_keys, results):
             if value is None:
                 continue
@@ -192,13 +178,26 @@ class CacheClass(BaseCache):
         If timeout is given, that timeout will be used for the key; otherwise
         the default cache timeout will be used.
         """
-        safe_data = {}
+        pipeline = self._client.pipeline()
         for key, value in data.iteritems():
-            safe_data[key] = pickle.dumps(value)
-        if safe_data:
-            self._cache.mset(dict((self.make_key(key, version=version), value)
-                                   for key, value in safe_data.iteritems()))
-            map(self.expire, safe_data, [timeout]*len(safe_data))
+            self.set(key, value, timeout, version=version, client=pipeline)
+        pipeline.execute()
+
+    def incr(self, key, delta=1, version=None):
+        """
+        Add delta to value in the cache. If the key does not exist, raise a
+        ValueError exception.
+        """
+        key = self.make_key(key, version=version)
+        exists = self._client.exists(key)
+        if not exists:
+            raise ValueError("Key '%s' not found" % key)
+        try:
+            value = self._client.incr(key, delta)
+        except redis.ResponseError:
+            value = self.get(key) + 1
+            self.set(key, value)
+        return value
 
     def close(self, **kwargs):
         """
@@ -228,7 +227,7 @@ class RedisCache(CacheClass):
             version = self.version
         old_key = self.make_key(key, version)
         value = self.get(old_key, version=version)
-        ttl = self._cache.ttl(old_key)
+        ttl = self._client.ttl(old_key)
         if value is None:
             raise ValueError("Key '%s' not found" % key)
         new_key = self.make_key(key, version=version+delta)
