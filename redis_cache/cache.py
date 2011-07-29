@@ -62,8 +62,7 @@ class CacheClass(BaseCache):
         else:
             host = server or 'localhost'
             port = 6379
-        self._cache = redis.Redis(host=host, port=port, db=db,
-            password=password, connection_pool=pool.get_connection_pool(host=host, port=port, db=db, password=password))
+        self._client = redis.Redis(host=host, port=port, db=db, password=password)
 
     def __getstate__(self):
         return self._initargs
